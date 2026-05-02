@@ -76,3 +76,4 @@ class CentroidKalman:
 
     def reset(self):
         self._initialized = False
+        self.kf.P = np.eye(4) * 100.0   # restore "we don't know" uncertainty

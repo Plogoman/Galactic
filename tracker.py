@@ -402,7 +402,6 @@ def main():
     tracker_label    = ""
     tracker_class_id = None
     trusted_bbox     = None
-    trusted_label    = ""
     trusted_class_id = None
     misses           = 0
     lost_hold        = 0
@@ -444,7 +443,8 @@ def main():
         # IDLE — search for first target
         # ---------------------------------------------------------------
         if state == LockState.IDLE:
-            target = pick_center_target(detections, fx, fy)
+            candidates = smoother.stable_only() or detections
+            target = pick_center_target(candidates, fx, fy)
             if target is not None:
                 new_tracker, new_bbox = init_tracker_on_detection(frame, target)
                 if new_tracker is not None:
@@ -453,7 +453,6 @@ def main():
                     tracker_label    = target["label"]
                     tracker_class_id = target["class_id"]
                     trusted_bbox     = new_bbox
-                    trusted_label    = tracker_label
                     trusted_class_id = tracker_class_id
                     misses           = 0
                     state            = LockState.LOCKED
@@ -484,7 +483,6 @@ def main():
                     agree_d2     = dist2(center_of_bbox(best_bbox), center_of_bbox(tracker_bbox)) if tracker_bbox else 10**9
 
                     trusted_bbox     = best_bbox
-                    trusted_label    = best["label"]
                     trusted_class_id = best["class_id"]
 
                     if (not ok_track) or (agree_iou < STRONG_MATCH_IOU) or (agree_d2 > STRONG_MATCH_DIST ** 2):
@@ -530,7 +528,6 @@ def main():
                     tracker_label    = target["label"]
                     tracker_class_id = target["class_id"]
                     trusted_bbox     = new_bbox
-                    trusted_label    = tracker_label
                     trusted_class_id = tracker_class_id
                     misses           = 0
                     state            = LockState.LOCKED
@@ -543,7 +540,6 @@ def main():
                 if lost_hold <= 0:
                     print("[LOST→IDLE] recovery window expired, full reset")
                     trusted_bbox     = None
-                    trusted_label    = ""
                     trusted_class_id = None
                     smoother.reset()
                     state            = LockState.IDLE

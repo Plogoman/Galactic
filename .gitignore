@@ -1,5 +1,6 @@
 # IDE config
 .vscode/
+.idea/
 
 # External dataset / competition folder
 3rd_Anti-UAV_CVPR23/
@@ -20,3 +21,6 @@ galactictesting.ipynb
 tuning.ipynb
 sample_preview.png
 cal_dataset
+
+# Junk / auto-generated
+kernel.errors.txt
