@@ -1,0 +1,13 @@
+# Core CV + ML
+opencv-contrib-python>=4.8.0   # contrib version required for CSRT/KCF/MOSSE trackers
+ultralytics>=8.0.0             # YOLOv8
+numpy>=1.24.0
+
+# OpenVINO — required for galactic_int8_openvino_model inference
+openvino>=2023.0
+
+# Serial comms to STM32 (graceful stub if not installed)
+pyserial>=3.5
+
+# Kalman smoothing (graceful fallback if not installed — set USE_KALMAN=False)
+filterpy>=1.4.5
