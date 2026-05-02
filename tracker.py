@@ -385,13 +385,15 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
     model    = YOLO(MODEL_PATH)
     ser      = open_serial()
     smoother = DetectionSmoother(ttl=SMOOTHER_TTL, match_dist=SMOOTHER_MATCH_DIST)
-    kalman   = CentroidKalman() if (USE_KALMAN and _KALMAN_AVAILABLE) else None
+    kalman   = CentroidKalman(dt=1.0 / src_fps) if (USE_KALMAN and _KALMAN_AVAILABLE) else None
 
     if kalman:
-        print("[kalman] Kalman filter active")
+        print(f"[kalman] Kalman filter active  dt={1.0/src_fps:.4f}s  ({src_fps:.1f} fps)")
 
     # --- tracking state ---
     state            = LockState.IDLE
