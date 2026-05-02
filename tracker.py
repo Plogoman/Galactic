@@ -1,4 +1,5 @@
 import time
+from enum import Enum, auto
 import cv2
 from ultralytics import YOLO
 
@@ -8,11 +9,20 @@ try:
 except ImportError:
     SERIAL_AVAILABLE = False
 
+from detection_smoother import DetectionSmoother
+
+try:
+    from kalman import CentroidKalman
+    _KALMAN_AVAILABLE = True
+except ImportError:
+    _KALMAN_AVAILABLE = False
+    print("[kalman] filterpy not installed — Kalman disabled. pip install filterpy")
+
 # ===========================================================================
 # CONFIG — all tunable constants here, not buried in logic
 # ===========================================================================
 
-VIDEO_SOURCE = r"C:\Users\ahmed\Downloads\antidrone\Anti-UAV-RGBT\test\20190925_111757_1_9\visible.mp4"               # 0 = default webcam; replace with a file path as needed
+VIDEO_SOURCE = r"C:\Users\ahmed\Downloads\antidrone\Anti-UAV-RGBT\test\20190925_111757_1_9\visible.mp4"
 LOOP_VIDEO = False
 
 MODEL_PATH = r"C:\Users\ahmed\Desktop\me\me\Coding\HARDCORE\Galatic_Defender\galactic_int8_openvino_model"
@@ -40,13 +50,12 @@ KD_Y = 0.10
 
 # --- Servo output ---
 # PD output is in [-1, 1]; 90 = stop, <90 = one direction, >90 = other.
-# Lower SERVO_SCALE keeps speed commands close to 90 (slow & precise). Start small, tune up.
 SERVO_SCALE = 30.0
 MAX_CMD_X = 1.0
 MAX_CMD_Y = 1.0
 
 # --- UART ---
-SERIAL_PORT = "/dev/ttyUSB0"   # Windows example: "COM3"
+SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
 # --- Re-acquisition ---
@@ -56,9 +65,27 @@ STRONG_MATCH_IOU = 0.10
 STRONG_MATCH_DIST = 90         # px
 PRINT_EVERY_N = 5
 
-TARGET_CLASS = None            # filter by class name, e.g. "drone"; None = accept all
-USE_CARTESIAN_Y = False        # False => screen coords (down = positive error_y)
+TARGET_CLASS = None            # filter by class name; None = accept all
+USE_CARTESIAN_Y = False
 SHOW_ALL_DETECTIONS = True
+
+# --- Detection Smoother ---
+SMOOTHER_TTL = 3               # frames a detection stays alive after last sighting
+SMOOTHER_MATCH_DIST = 60       # px — max centroid movement to still be same detection
+
+# --- Kalman filter ---
+USE_KALMAN = True              # smooth PD input; set False if filterpy not available
+
+
+# ===========================================================================
+# STATE MACHINE
+# ===========================================================================
+
+class LockState(Enum):
+    IDLE   = auto()   # searching, no active tracker
+    LOCKED = auto()   # tracker running, PD active
+    LOST   = auto()   # tracker dropped, recovery window active
+
 
 # ===========================================================================
 # HELPERS
@@ -122,7 +149,6 @@ def pd_to_servo_speed(pd_output):
 # PD CONTROLLER
 # Continuous rotation servos need speed commands, not position — integral would
 # cause runaway spinning with no position feedback, so PD is the right choice.
-# dt is tracked internally via time.time() for accurate derivative calculation.
 # ===========================================================================
 
 class PD:
@@ -138,11 +164,7 @@ class PD:
 
     def update(self, error):
         now = time.time()
-
-        if self._prev_t is None:
-            dt = 0.0
-        else:
-            dt = max(now - self._prev_t, 1e-3)
+        dt = 0.0 if self._prev_t is None else max(now - self._prev_t, 1e-3)
         self._prev_t = now
 
         derivative = 0.0
@@ -263,10 +285,18 @@ def init_tracker_on_detection(frame, det):
 # DRAWING
 # ===========================================================================
 
-def draw(frame, tracker_bbox, target_label, all_dets,
-         fx, fy, cmd_x, cmd_y, q, locked,
-         pan_spd, tilt_spd, trusted_bbox=None):
+_STATE_COLORS = {
+    LockState.IDLE:   (0, 165, 255),   # orange
+    LockState.LOCKED: (0, 255, 0),     # green
+    LockState.LOST:   (0, 80, 255),    # red-orange
+}
+
+
+def draw(frame, state, tracker_bbox, target_label, all_dets,
+         fx, fy, cmd_x, cmd_y, q, deadband_locked,
+         pan_spd, tilt_spd, trusted_bbox=None, smooth_target=None):
     h, w = frame.shape[:2]
+    state_color = _STATE_COLORS[state]
 
     if SHOW_ALL_DETECTIONS:
         for d in all_dets:
@@ -289,22 +319,32 @@ def draw(frame, tracker_bbox, target_label, all_dets,
 
     if tracker_bbox is not None:
         x, y, bw, bh = tracker_bbox
-        cx, cy = center_of_bbox(tracker_bbox)
-        color = (0, 255, 0) if locked else (0, 180, 255)
+        raw_cx, raw_cy = center_of_bbox(tracker_bbox)
 
-        cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-        cv2.drawMarker(frame, (cx, cy), color, cv2.MARKER_CROSS, 16, 2)
-        cv2.line(frame, (fx, fy), (cx, cy), (255, 0, 255), 2)
+        # Draw the raw tracker box
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), state_color, 2)
+        cv2.drawMarker(frame, (raw_cx, raw_cy), state_color, cv2.MARKER_CROSS, 16, 2)
+
+        # Line and crosshair follow the Kalman-smoothed point if available
+        aim_cx = smooth_target[0] if smooth_target else raw_cx
+        aim_cy = smooth_target[1] if smooth_target else raw_cy
+        cv2.line(frame, (fx, fy), (aim_cx, aim_cy), (255, 0, 255), 2)
+        if smooth_target:
+            cv2.drawMarker(frame, (aim_cx, aim_cy), (255, 0, 255), cv2.MARKER_CROSS, 12, 1)
 
         cv2.putText(frame, f"{target_label} | {q}", (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
         cv2.putText(frame, f"cmd=({cmd_x:+.3f}, {cmd_y:+.3f})", (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
         cv2.putText(frame, f"servo spd pan={pan_spd} tilt={tilt_spd}", (10, 76),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 220, 255), 2)
     else:
-        cv2.putText(frame, "NO TRACKER", (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+        cv2.putText(frame, f"State: {state.name}", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, state_color, 2)
+
+    # State badge bottom-right
+    cv2.putText(frame, state.name, (w - 110, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
 
 
 # ===========================================================================
@@ -345,9 +385,16 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
-    model = YOLO(MODEL_PATH)
-    ser   = open_serial()
+    model    = YOLO(MODEL_PATH)
+    ser      = open_serial()
+    smoother = DetectionSmoother(ttl=SMOOTHER_TTL, match_dist=SMOOTHER_MATCH_DIST)
+    kalman   = CentroidKalman() if (USE_KALMAN and _KALMAN_AVAILABLE) else None
 
+    if kalman:
+        print("[kalman] Kalman filter active")
+
+    # --- tracking state ---
+    state            = LockState.IDLE
     tracker          = None
     tracker_bbox     = None
     tracker_label    = ""
@@ -375,31 +422,27 @@ def main():
 
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
         frame_idx += 1
+        fx, fy = FRAME_W // 2, FRAME_H // 2
 
-        fx, fy     = FRAME_W // 2, FRAME_H // 2
-        detections = []
-
-        run_detect = (tracker is None) or (frame_idx % DETECT_EVERY_N == 0) or (misses > 0)
+        # ---------------------------------------------------------------
+        # DETECTION — run every frame when IDLE/LOST, throttled when LOCKED
+        # ---------------------------------------------------------------
+        run_detect = (
+            state in (LockState.IDLE, LockState.LOST) or
+            (state == LockState.LOCKED and
+             (frame_idx % DETECT_EVERY_N == 0 or misses > 0))
+        )
         if run_detect:
-            detections = detect(model, frame)
+            raw_dets = detect(model, frame)
+            detections = smoother.update(raw_dets)
+        else:
+            detections = smoother.update([])
 
-        # -------------------------------------------------------------------
-        # TARGET ACQUISITION / TRACKING
-        # -------------------------------------------------------------------
-        if tracker is None:
-            target = None
-
-            if lost_hold > 0 and trusted_bbox is not None and detections:
-                target = pick_best_detection_for_reference(detections, trusted_bbox, trusted_class_id)
-                lost_hold -= 1
-                if target is not None:
-                    print(f"[recover] found trusted target: {target['label']} bbox={target['bbox']}")
-
-            if target is None and detections:
-                target = pick_center_target(detections, fx, fy)
-                if target is not None:
-                    print(f"[detect] acquired: {target['label']} bbox={target['bbox']}")
-
+        # ---------------------------------------------------------------
+        # IDLE — search for first target
+        # ---------------------------------------------------------------
+        if state == LockState.IDLE:
+            target = pick_center_target(detections, fx, fy)
             if target is not None:
                 new_tracker, new_bbox = init_tracker_on_detection(frame, target)
                 if new_tracker is not None:
@@ -411,11 +454,15 @@ def main():
                     trusted_label    = tracker_label
                     trusted_class_id = tracker_class_id
                     misses           = 0
-                else:
-                    tracker      = None
-                    tracker_bbox = None
+                    state            = LockState.LOCKED
+                    if kalman:
+                        kalman.reset()
+                    print(f"[IDLE→LOCKED] acquired: {tracker_label} bbox={tracker_bbox}")
 
-        else:
+        # ---------------------------------------------------------------
+        # LOCKED — advance tracker, snap to detector when they disagree
+        # ---------------------------------------------------------------
+        elif state == LockState.LOCKED:
             ok_track, bbox = tracker.update(frame)
 
             if ok_track:
@@ -427,14 +474,12 @@ def main():
             if detections:
                 ref_bbox     = trusted_bbox     if trusted_bbox     is not None else tracker_bbox
                 ref_class_id = trusted_class_id if trusted_class_id is not None else tracker_class_id
-
                 best = pick_best_detection_for_reference(detections, ref_bbox, ref_class_id)
 
                 if best is not None:
-                    best_bbox = tuple(map(int, best["bbox"]))
-
-                    agree_iou = iou_xywh(best_bbox, tracker_bbox) if tracker_bbox else 0.0
-                    agree_d2  = dist2(center_of_bbox(best_bbox), center_of_bbox(tracker_bbox)) if tracker_bbox else 10**9
+                    best_bbox    = tuple(map(int, best["bbox"]))
+                    agree_iou    = iou_xywh(best_bbox, tracker_bbox) if tracker_bbox else 0.0
+                    agree_d2     = dist2(center_of_bbox(best_bbox), center_of_bbox(tracker_bbox)) if tracker_bbox else 10**9
 
                     trusted_bbox     = best_bbox
                     trusted_label    = best["label"]
@@ -448,40 +493,85 @@ def main():
                             tracker_label    = best["label"]
                             tracker_class_id = best["class_id"]
                             misses           = 0
+                            if kalman:
+                                kalman.reset()
                             print(f"[snap] tracker -> detector {tracker_label} bbox={tracker_bbox}")
                     else:
                         tracker_label    = best["label"]
                         tracker_class_id = best["class_id"]
 
             if misses >= TRACKER_MAX_MISSES:
-                print("[lost] tracker dropped, entering recovery hold")
-                tracker          = None
-                tracker_bbox     = None
-                tracker_label    = trusted_label
-                tracker_class_id = trusted_class_id
-                lost_hold        = LOST_HOLD_FRAMES
-                misses           = 0
+                print("[LOCKED→LOST] tracker dropped, entering recovery hold")
+                tracker      = None
+                tracker_bbox = None
+                lost_hold    = LOST_HOLD_FRAMES
+                misses       = 0
+                state        = LockState.LOST
+                if kalman:
+                    kalman.reset()
                 pd_x.reset()
                 pd_y.reset()
 
-        # -------------------------------------------------------------------
-        # PD → servo speed commands → UART
-        # 90 = stop. Only sends when a drone is actively tracked.
-        # -------------------------------------------------------------------
-        cmd_x, cmd_y = 0.0, 0.0
-        pan_spd      = 90
-        tilt_spd     = 90
-        q            = "NONE"
-        locked       = False
+        # ---------------------------------------------------------------
+        # LOST — recovery window: try to re-acquire the trusted target
+        # ---------------------------------------------------------------
+        elif state == LockState.LOST:
+            target = None
+            if trusted_bbox is not None and detections:
+                target = pick_best_detection_for_reference(detections, trusted_bbox, trusted_class_id)
 
-        if tracker_bbox is not None:
-            cx, cy = center_of_bbox(tracker_bbox)
+            if target is not None:
+                new_tracker, new_bbox = init_tracker_on_detection(frame, target)
+                if new_tracker is not None:
+                    tracker          = new_tracker
+                    tracker_bbox     = new_bbox
+                    tracker_label    = target["label"]
+                    tracker_class_id = target["class_id"]
+                    trusted_bbox     = new_bbox
+                    trusted_label    = tracker_label
+                    trusted_class_id = tracker_class_id
+                    misses           = 0
+                    state            = LockState.LOCKED
+                    if kalman:
+                        kalman.reset()
+                    print(f"[LOST→LOCKED] re-acquired: {tracker_label} bbox={tracker_bbox}")
+
+            if state == LockState.LOST:  # still lost after re-acquire attempt
+                lost_hold -= 1
+                if lost_hold <= 0:
+                    print("[LOST→IDLE] recovery window expired, full reset")
+                    trusted_bbox     = None
+                    trusted_label    = ""
+                    trusted_class_id = None
+                    smoother.reset()
+                    state            = LockState.IDLE
+
+        # ---------------------------------------------------------------
+        # PD → Kalman-smoothed errors → servo speed commands → UART
+        # Only active while LOCKED.
+        # ---------------------------------------------------------------
+        cmd_x, cmd_y    = 0.0, 0.0
+        pan_spd         = 90
+        tilt_spd        = 90
+        q               = "NONE"
+        deadband_locked = False
+        smooth_target   = None
+
+        if state == LockState.LOCKED and tracker_bbox is not None:
+            raw_cx, raw_cy = center_of_bbox(tracker_bbox)
+
+            if kalman:
+                sx, sy = kalman.update(raw_cx, raw_cy)
+                cx, cy = int(sx), int(sy)
+                smooth_target = (cx, cy)
+            else:
+                cx, cy = raw_cx, raw_cy
+
             ex, ey = compute_errors(cx, cy, fx, fy)
+            deadband_locked = in_deadband(cx, cy, fx, fy, CENTER_BOX_W, CENTER_BOX_H)
+            q               = quadrant(cx, cy, fx, fy, CENTER_BOX_W, CENTER_BOX_H)
 
-            locked = in_deadband(cx, cy, fx, fy, CENTER_BOX_W, CENTER_BOX_H)
-            q      = quadrant(cx, cy, fx, fy, CENTER_BOX_W, CENTER_BOX_H)
-
-            if locked:
+            if deadband_locked:
                 pd_x.reset()
                 pd_y.reset()
             else:
@@ -495,17 +585,19 @@ def main():
 
             if frame_idx % PRINT_EVERY_N == 0:
                 print(
+                    f"[{state.name}] "
                     f"cmd_x={cmd_x:+.3f} cmd_y={cmd_y:+.3f} "
                     f"err_x={ex:+.3f} err_y={ey:+.3f} "
                     f"pan_spd={pan_spd} tilt_spd={tilt_spd} "
-                    f"quadrant={q} locked={locked}"
+                    f"quadrant={q} deadband={deadband_locked}"
                 )
 
         draw(
-            frame, tracker_bbox, tracker_label, detections,
-            fx, fy, cmd_x, cmd_y, q, locked,
+            frame, state, tracker_bbox, tracker_label, detections,
+            fx, fy, cmd_x, cmd_y, q, deadband_locked,
             pan_spd, tilt_spd,
             trusted_bbox=trusted_bbox,
+            smooth_target=smooth_target,
         )
 
         cv2.imshow("Drone Tracker", frame)

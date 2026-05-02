@@ -125,3 +125,129 @@ which would change the format to `"pan_spd,tilt_spd,quadrant\n"`.
 
 1. Adjust `VIDEO_SOURCE`, `MODEL_PATH`, `SERIAL_PORT`, and PD gains at the top of `tracker.py`.
 2. Run: `python tracker.py`
+
+---
+
+# Merge — Mark's Additions
+
+The following files and changes were written by **Mark** and merged into the project.
+
+---
+
+## New Files
+
+### `kalman.py`
+
+A 2D constant-velocity Kalman filter for the tracked target's centroid.
+
+**Problem it solves:** The raw centroid coming out of the OpenCV tracker jitters
+frame-to-frame. Without smoothing, the PD controller sees high-frequency noise as
+large derivatives and over-drives the servos — the turret looks twitchy even when
+the target is barely moving.
+
+**How it works:**
+- State vector `[x, y, vx, vy]` — position and velocity
+- Measurement `[x, y]` — only position is observed
+- Each frame: **predict** (project position forward using velocity model) then
+  **update** (fuse prediction with the noisy measurement)
+- Returns `(smoothed_x, smoothed_y)` — the PD controller uses this instead of raw centroid
+
+**Key tuning knobs (inside `kalman.py`):**
+
+| Parameter | Effect |
+|---|---|
+| `R *= 5.0` | Measurement noise — higher = smoother but laggier |
+| `Q *= 0.1` | Process noise — higher = reacts faster to acceleration |
+| `dt = 1/30` | Expected frame interval — adjust for your camera FPS |
+
+**Dependencies:** `pip install filterpy`
+If `filterpy` is not installed the import fails silently and `USE_KALMAN` is
+automatically treated as `False` — no crash.
+
+**Lead-aim bonus:** `kalman.predict_next()` returns where the target will be one
+step ahead. Not wired into the PD loop yet, but available for future latency
+compensation.
+
+---
+
+### `detection_smoother.py`
+
+An anti-flicker layer that sits between the YOLO detector and the rest of the pipeline.
+
+**Problem it solves:** YOLO detects a drone in frame N, misses it in N+1 (occlusion,
+motion blur, confidence dip), finds it again in N+2. Without smoothing, that one-frame
+gap causes the tracker to drop lock and snap to whatever else is in frame, or the drawn
+boxes flash in and out.
+
+**How it works:**
+- Keeps each detection "alive" for `SMOOTHER_TTL` frames after its last sighting
+- Each new frame, fresh detections are matched to live entries by class + centroid proximity
+  (within `SMOOTHER_MATCH_DIST` px)
+- Matched entries get their TTL reset and a hit counter incremented
+- Unmatched entries age by 1 TTL; entries that reach 0 are dropped
+- Returns the flicker-free list, ordered most-stable first
+
+**`stable_only()`** — returns only detections seen 2+ consecutive frames. Used by
+auto-lock so the system won't immediately lock onto a single-frame noise detection.
+
+**Config knobs (in `tracker.py`):**
+
+| Constant | Default | Effect |
+|---|---|---|
+| `SMOOTHER_TTL` | 3 | How many frames a detection stays alive after a miss |
+| `SMOOTHER_MATCH_DIST` | 60 px | Max centroid movement to count as the same detection |
+
+---
+
+## Changes to `tracker.py`
+
+### `LockState` State Machine
+
+Replaced the implicit `tracker is None` / `misses` / `lost_hold` integer logic with
+an explicit three-state machine:
+
+| State | Meaning | What runs |
+|---|---|---|
+| `IDLE` | No target, searching | Detector every frame, pick closest-to-center |
+| `LOCKED` | Tracker active, PD running | Tracker every frame, detector every `DETECT_EVERY_N` |
+| `LOST` | Tracker dropped, recovery window | Detector every frame, try to re-acquire trusted target |
+
+**Transitions:**
+
+```
+IDLE ──(detection found)──► LOCKED
+LOCKED ──(misses ≥ MAX)───► LOST
+LOST ──(re-acquired)──────► LOCKED
+LOST ──(hold expires)─────► IDLE
+```
+
+All transitions are printed to the terminal: `[IDLE→LOCKED]`, `[LOCKED→LOST]`, etc.
+
+**Why this is better than the old approach:**
+- Recovery logic is no longer tangled into the acquisition block via a countdown variable
+- Each state has one clear responsibility
+- Adding a new behaviour (e.g. manual click-to-lock) means adding a branch, not
+  patching a chain of `if tracker is None` conditions
+
+### Kalman integrated into PD section
+
+In the LOCKED PD block, `tracker_bbox` centroid is fed through `kalman.update()` before
+computing errors. The Kalman-smoothed `(sx, sy)` drives `compute_errors()` and the
+on-screen aim crosshair. The raw tracker bounding box is still drawn unmodified.
+
+Kalman is reset (`kalman.reset()`) on every tracker re-initialisation — new lock,
+detector snap, and recovery re-acquire — so the velocity model always starts from zero
+on a fresh target.
+
+### Detection smoother integrated into detect loop
+
+Every call to `detect(model, frame)` is now wrapped:
+```python
+raw_dets   = detect(model, frame)
+detections = smoother.update(raw_dets)
+```
+On frames where the detector is skipped (throttled LOCKED frames), `smoother.update([])`
+is called so the TTL counters still tick and stale ghosts don't linger indefinitely.
+
+When the LOST window expires and the system resets to IDLE, `smoother.reset()` is also
+called to clear any lingering entries from the previous track.
